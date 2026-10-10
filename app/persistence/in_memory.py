@@ -42,6 +42,13 @@ class InMemoryRepository(PersistenceRepository):
         # Simulates RLS: owner_id = auth.uid()
         return p if (p and p.owner_id == owner_id) else None
 
+    async def update_project_metadata(
+        self, project_id: uuid.UUID, repo_metadata: dict, owner_id: str
+    ) -> None:
+        p = self._projects.get(project_id)
+        if p and p.owner_id == owner_id:
+            self._projects[project_id] = p.model_copy(update={"repo_metadata": repo_metadata})
+
     # ------------------------------------------------------------------
     # Test Definitions
     # ------------------------------------------------------------------

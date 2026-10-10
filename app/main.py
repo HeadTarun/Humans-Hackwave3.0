@@ -6,6 +6,7 @@ from fastapi.responses import JSONResponse
 
 from app.middleware.request_id import RequestIdMiddleware, get_request_id
 from app.routes import projects, repairs, runs, tests
+from app.routes import repository as repo_routes
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,6 +26,7 @@ def create_app() -> FastAPI:
 
     # Routes
     app.include_router(projects.router, prefix="/projects", tags=["projects"])
+    app.include_router(repo_routes.router, prefix="/projects", tags=["repository"])
     app.include_router(tests.router, tags=["tests"])
     app.include_router(runs.router, tags=["runs"])
     app.include_router(repairs.router, tags=["repairs"])

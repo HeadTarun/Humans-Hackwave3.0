@@ -29,6 +29,16 @@ class ClassificationResult:
     repair_candidate: dict[str, Any] | None = None  # Validated JSON only
 
 
+@dataclass
+class SandboxResult:
+    """Result of a successful sandbox creation (Phase 3)."""
+    sandbox_id: str
+    base_url: str           # Public URL reachable by Playwright
+    startup_logs: str       # Combined stdout/stderr from start_cmd
+    startup_time_ms: int    # Wall-clock ms from create → healthy
+    repo_path: str          # Path inside sandbox where repo was written
+
+
 # ---------------------------------------------------------------------------
 # Abstract interfaces
 # ---------------------------------------------------------------------------
@@ -46,8 +56,13 @@ class SandboxRunner(ABC):
     """Phase 3: E2B — creates disposable isolated sandboxes."""
 
     @abstractmethod
-    async def create_sandbox(self, repo_path: str, start_cmd: str) -> str:
-        """Create sandbox, start app, return sandbox_id / base_url."""
+    async def create_sandbox(
+        self,
+        repo_path: str,
+        start_cmd: str,
+        env_vars: dict[str, str] | None = None,
+    ) -> "SandboxResult":
+        """Create sandbox, upload repo, start app, return SandboxResult."""
         ...
 
     @abstractmethod
@@ -62,8 +77,8 @@ class BrowserRunner(ABC):
     @abstractmethod
     async def execute_plan(
         self, base_url: str, plan: ActionPlan
-    ) -> dict[str, Any]:
-        """Run plan, return normalized evidence dict (screenshots, console, network…)."""
+    ) -> "Any":
+        """Run plan, return BrowserEvidence (or dict for fakes)."""
         ...
 
 
@@ -109,20 +124,32 @@ class FakeRepositoryInspector(RepositoryInspector):
 
 
 class FakeSandboxRunner(SandboxRunner):
-    """Returns a fake sandbox ID immediately. No E2B connection."""
+    """Returns a fake SandboxResult immediately. No E2B connection."""
 
     def __init__(self, base_url: str = "http://localhost:3000") -> None:
         self.base_url = base_url
         self.created: list[str] = []
         self.destroyed: list[str] = []
 
-    async def create_sandbox(self, repo_path: str, start_cmd: str) -> str:
+    async def create_sandbox(
+        self,
+        repo_path: str,
+        start_cmd: str,
+        env_vars: dict[str, str] | None = None,
+    ) -> SandboxResult:
         sandbox_id = f"fake-sandbox-{len(self.created) + 1}"
         self.created.append(sandbox_id)
-        return sandbox_id
+        return SandboxResult(
+            sandbox_id=sandbox_id,
+            base_url=self.base_url,
+            startup_logs="[fake] app started",
+            startup_time_ms=0,
+            repo_path="/fake/repo",
+        )
 
     async def destroy_sandbox(self, sandbox_id: str) -> None:
         self.destroyed.append(sandbox_id)
+
 
 
 class FakeBrowserRunner(BrowserRunner):

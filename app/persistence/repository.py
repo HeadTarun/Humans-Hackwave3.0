@@ -30,6 +30,11 @@ class PersistenceRepository(ABC):
     @abstractmethod
     async def get_project(self, project_id: uuid.UUID, owner_id: str) -> Project | None: ...
 
+    @abstractmethod
+    async def update_project_metadata(
+        self, project_id: uuid.UUID, repo_metadata: dict, owner_id: str
+    ) -> None: ...
+
     # ------------------------------------------------------------------
     # Test Definitions
     # ------------------------------------------------------------------
