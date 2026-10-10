@@ -86,8 +86,22 @@ class FailureClassifier(ABC):
     """Phase 4: deterministic rules; Phase 5: Groq fallback for ambiguous cases."""
 
     @abstractmethod
-    async def classify(self, evidence: dict[str, Any]) -> ClassificationResult:
-        """Classify failure. Deterministic rules first; Groq only when rules can't decide."""
+    async def classify(
+        self,
+        evidence: dict[str, Any],
+        repo_context: dict[str, Any] | None = None,
+    ) -> ClassificationResult:
+        """Classify failure.
+
+        Args:
+            evidence:     Serialised BrowserEvidence dict (from to_dict()).
+            repo_context: Optional Tree-sitter inspection bundle stored in
+                          project.repo_metadata["inspection_result"].
+                          Provides source-confirmed locator candidates.
+
+        Rules:
+            Deterministic rules first; Groq only when rules cannot decide.
+        """
         ...
 
 
@@ -190,7 +204,11 @@ class FakeFailureClassifier(FailureClassifier):
             summary="Fake: locator drift detected",
         )
 
-    async def classify(self, evidence: dict[str, Any]) -> ClassificationResult:
+    async def classify(
+        self,
+        evidence: dict[str, Any],
+        repo_context: dict[str, Any] | None = None,
+    ) -> ClassificationResult:
         return self._result
 
 

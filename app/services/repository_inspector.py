@@ -201,12 +201,18 @@ class TreeSitterInspector(RepositoryInspector):
 
         exports: list[str] = []
         test_ids: list[str] = []
+        button_texts: list[str] = []
+        link_texts: list[str] = []
 
         if self._ts_available and self._parser and self._language:
             try:
                 tree = self._parser.parse(source.encode("utf-8", errors="replace"))
                 exports = self._extract_exports(tree.root_node, source)
                 test_ids = self._extract_locator_attrs(tree.root_node, source)
+                # Gap 4: Extract button and link text — most common LOCATOR_DRIFT target
+                button_texts, link_texts = self._extract_button_link_texts(
+                    tree.root_node, source
+                )
             except Exception as exc:
                 logger.debug("Tree-sitter parse error for %s: %s", fpath, exc)
 
@@ -216,6 +222,8 @@ class TreeSitterInspector(RepositoryInspector):
             "file": str(fpath.relative_to(root)),
             "exports": exports,
             "test_ids": test_ids[:20],
+            "button_texts": button_texts[:20],   # Gap 4: button label text
+            "link_texts": link_texts[:20],        # Gap 4: anchor label text
             "snippet": snippet,
         }
 
@@ -282,10 +290,85 @@ class TreeSitterInspector(RepositoryInspector):
             logger.debug("Locator attr query error: %s", exc)
             return []
 
+    def _extract_button_link_texts(
+        self, root_node: Any, source: str
+    ) -> tuple[list[str], list[str]]:
+        """Gap 4: Extract text content of <button> and <a> JSX elements.
 
-# ---------------------------------------------------------------------------
-# File classification helpers
-# ---------------------------------------------------------------------------
+        This is the single most valuable data for LOCATOR_DRIFT repair:
+        when a button label changes from 'Checkout' to 'Complete Order',
+        Tree-sitter tells us the new label from source WITHOUT running the app.
+
+        Uses text-walking (no query API) for maximum compatibility with
+        tree-sitter-javascript 0.23.x node types.
+        """
+        button_texts: list[str] = []
+        link_texts: list[str] = []
+
+        def _collect_jsx_text(node: Any) -> str:
+            """Recursively collect all jsx_text leaf content under a node."""
+            parts: list[str] = []
+            if node.type == "jsx_text":
+                parts.append(source[node.start_byte:node.end_byte].strip())
+            for child in (node.children or []):
+                parts.append(_collect_jsx_text(child))
+            return " ".join(p for p in parts if p).strip()
+
+        def _walk(node: Any) -> None:
+            if node.type in ("jsx_element", "jsx_self_closing_element"):
+                # Check the opening tag name
+                open_tag = None
+                for child in (node.children or []):
+                    if child.type == "jsx_opening_element":
+                        open_tag = child
+                        break
+                    if child.type == "jsx_self_closing_element":
+                        open_tag = child
+                        break
+
+                if open_tag is not None:
+                    # Get tag name from first child that is identifier/member_expression
+                    tag_name = ""
+                    for c in (open_tag.children or []):
+                        if c.type in ("identifier", "member_expression"):
+                            tag_name = source[c.start_byte:c.end_byte].lower()
+                            break
+
+                    if tag_name == "button":
+                        text = _collect_jsx_text(node)
+                        if text and len(text) < 80:
+                            button_texts.append(text)
+                    elif tag_name == "a":
+                        text = _collect_jsx_text(node)
+                        if text and len(text) < 80:
+                            link_texts.append(text)
+
+            for child in (node.children or []):
+                if len(button_texts) + len(link_texts) < 40:  # bounded
+                    _walk(child)
+
+        try:
+            _walk(root_node)
+        except Exception as exc:
+            logger.debug("Button/link text extraction error: %s", exc)
+
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        unique_buttons = []
+        for t in button_texts:
+            if t not in seen:
+                seen.add(t)
+                unique_buttons.append(t)
+
+        seen_links: set[str] = set()
+        unique_links = []
+        for t in link_texts:
+            if t not in seen_links:
+                seen_links.add(t)
+                unique_links.append(t)
+
+        return unique_buttons[:20], unique_links[:20]
+
 
 def _is_route_file(rel: str) -> bool:
     parts = Path(rel).parts

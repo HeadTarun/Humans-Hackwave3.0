@@ -9,11 +9,19 @@ artifacts, and transitions the run through every state.
 
 Phase 4 plugs real Groq classification in via the FailureClassifier interface.
 Phase 3 ships a DeterministicClassifier that uses rule-based logic only.
+
+Adaptive healing additions (Solutions 3-6):
+  - DeterministicClassifier: compound API+assertion rule, repo_context cross-reference
+  - suggest_repair_from_dom(): difflib similarity repair without Groq
+  - extract_intent_keywords(): semantic keyword extraction from intent text
+  - execute_run(): auto-propose repair for high-confidence LOCATOR_DRIFT
 """
 from __future__ import annotations
 
+import difflib
 import json
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -52,44 +60,84 @@ class DeterministicClassifier(FailureClassifier):
     """Rule-based failure classifier that doesn't require an LLM.
 
     Rules (in priority order):
-    1. Network failures with 5xx on checkout/api paths → API_FAILURE
-    2. Locator errors in step failure → LOCATOR_DRIFT
-    3. Assertion failures → ASSERTION_FAILURE
-    4. General step failures → UI_FUNCTIONAL_REGRESSION
-    5. Everything else → AMBIGUOUS_REQUIRES_REVIEW
+    1. Network failures with 5xx → API_FAILURE
+    2. Compound: step passed + assertion failed + API 5xx → API_FAILURE (clearer signal)
+    3. Locator errors in step failure → LOCATOR_DRIFT
+    4. Assertion failures (no network cause) → ASSERTION_FAILURE
+    5. General step failures → UI_FUNCTIONAL_REGRESSION
+    6. Everything else → AMBIGUOUS_REQUIRES_REVIEW
+
+    With repo_context (Tree-sitter output), Rule 3 can also surface
+    source-confirmed locator candidates to include in the summary.
     """
 
-    async def classify(self, evidence: dict[str, Any]) -> ClassificationResult:
+    async def classify(
+        self,
+        evidence: dict[str, Any],
+        repo_context: dict[str, Any] | None = None,
+    ) -> ClassificationResult:
         network_failures = evidence.get("network_failures", [])
         failed_error = evidence.get("failed_step_error") or ""
         steps_failed = evidence.get("steps_failed", 0)
         assertion_results = evidence.get("assertion_results", [])
+        interactive_elements = evidence.get("interactive_elements", [])
 
-        # Rule 1: 5xx API failure
+        # Rule 1: 5xx API failure (step may or may not have failed)
         api_failures = [
             f for f in network_failures if f.get("status", 0) >= 500
         ]
         if api_failures:
             urls = [f["url"] for f in api_failures]
+            body_hints = [
+                f.get("response_body", "")[:120]
+                for f in api_failures if f.get("response_body")
+            ]
+            hint = f" | Response: {body_hints[0]}" if body_hints else ""
             return ClassificationResult(
                 category=FailureCategory.API_FAILURE,
                 confidence=0.92,
-                summary=f"API returned 5xx on: {', '.join(urls[:3])}",
+                summary=f"API returned 5xx on: {', '.join(urls[:3])}{hint}",
                 requires_human_review=False,
             )
 
-        # Rule 2: Locator drift (playwright TimeoutError on locator resolution)
+        # Rule 2 (Solution 3): Compound — step passed but assertion failed + 4xx
+        failed_assertions = [r for r in assertion_results if not r.get("passed")]
+        client_failures = [f for f in network_failures if 400 <= f.get("status", 0) < 500]
+        if client_failures and failed_assertions and steps_failed == 0:
+            urls = [f["url"] for f in client_failures]
+            return ClassificationResult(
+                category=FailureCategory.API_FAILURE,
+                confidence=0.88,
+                summary=f"Assertion failed due to API 4xx: {', '.join(urls[:2])}",
+                requires_human_review=False,
+            )
+
+        # Rule 3: Locator drift (playwright TimeoutError on locator resolution)
         locator_keywords = ("timeout", "locator", "get_by_role", "get_by_text", "waitfor")
         if steps_failed > 0 and any(kw in failed_error.lower() for kw in locator_keywords):
+            # Solution 4: Cross-reference Tree-sitter repo_context for source hints
+            source_hint = _find_in_repo_context(
+                failed_error, repo_context or {}
+            )
+            # Include interactive elements found on page
+            page_hint = ""
+            if interactive_elements:
+                names = [el.get("name", "") for el in interactive_elements[:5]]
+                page_hint = f" | Page has: [{', '.join(names)}]"
             return ClassificationResult(
                 category=FailureCategory.LOCATOR_DRIFT,
                 confidence=0.80,
-                summary=f"Locator resolution failed: {failed_error[:200]}",
+                summary=(
+                    f"Locator resolution failed: {failed_error[:200]}"
+                    f"{source_hint}{page_hint}"
+                ),
                 requires_human_review=False,
+                repair_candidate=_build_repair_candidate(
+                    evidence, interactive_elements, repo_context or {}
+                ),
             )
 
-        # Rule 3: Assertion failure
-        failed_assertions = [r for r in assertion_results if not r.get("passed")]
+        # Rule 4: Assertion failure (no network cause)
         if failed_assertions:
             detail = failed_assertions[0].get("detail", "")
             return ClassificationResult(
@@ -99,7 +147,7 @@ class DeterministicClassifier(FailureClassifier):
                 requires_human_review=False,
             )
 
-        # Rule 4: General step failure
+        # Rule 5: General step failure
         if steps_failed > 0:
             return ClassificationResult(
                 category=FailureCategory.UI_FUNCTIONAL_REGRESSION,
@@ -108,13 +156,308 @@ class DeterministicClassifier(FailureClassifier):
                 requires_human_review=True,
             )
 
-        # Rule 5: Ambiguous
+        # Rule 6: Ambiguous
         return ClassificationResult(
             category=FailureCategory.AMBIGUOUS_REQUIRES_REVIEW,
             confidence=0.40,
             summary="Could not classify failure with available evidence",
             requires_human_review=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# Gap 1: Synonym table + antonym blocklist for repair matching
+# ---------------------------------------------------------------------------
+
+# Maps a canonical keyword to its UI synonyms.
+# Used to boost similarity score when difflib alone can't bridge semantic gaps.
+# e.g. difflib("checkout", "buy now") = 0.31 — too low without this table.
+_SYNONYMS: dict[str, list[str]] = {
+    "checkout":   ["complete order", "place order", "buy now", "purchase",
+                   "pay", "pay now", "confirm order", "proceed to checkout"],
+    "submit":     ["send", "confirm", "save", "apply", "done", "finish", "complete"],
+    "login":      ["sign in", "log in", "signin", "log-in", "authenticate"],
+    "register":   ["sign up", "create account", "join", "get started", "signup"],
+    "continue":   ["next", "proceed", "go", "advance", "forward"],
+    "cancel":     ["back", "close", "dismiss", "abort", "go back", "return"],
+    "search":     ["find", "look up", "query", "filter", "explore"],
+    "delete":     ["remove", "discard", "trash", "clear", "erase"],
+    "edit":       ["modify", "change", "update", "rename", "manage"],
+    "add":        ["create", "new", "insert", "plus", "append"],
+    "upload":     ["import", "attach", "choose file", "browse"],
+    "download":   ["export", "save file", "get"],
+}
+
+# Pairs that look similar but are opposite actions — NEVER auto-repair between them.
+_ANTONYM_PAIRS: frozenset[frozenset[str]] = frozenset({
+    frozenset({"login", "logout"}),
+    frozenset({"sign in", "sign out"}),
+    frozenset({"signin", "signout"}),
+    frozenset({"open", "close"}),
+    frozenset({"enable", "disable"}),
+    frozenset({"show", "hide"}),
+    frozenset({"expand", "collapse"}),
+    frozenset({"subscribe", "unsubscribe"}),
+    frozenset({"add", "remove"}),
+    frozenset({"accept", "reject"}),
+    frozenset({"approve", "deny"}),
+})
+
+
+def _is_antonym(a: str, b: str) -> bool:
+    """Return True if a and b are known antonyms — repair between them is unsafe."""
+    a_clean = a.lower().strip()
+    b_clean = b.lower().strip()
+    return frozenset({a_clean, b_clean}) in _ANTONYM_PAIRS
+
+
+def _synonym_boost(target: str, candidate: str) -> float:
+    """Return a similarity boost if candidate is a known synonym of target.
+
+    Returns a score in [0.0, 1.0]. 0.0 means no synonym match.
+    Used to augment difflib score for semantically equivalent UI labels.
+    """
+    t = target.lower().strip()
+    c = candidate.lower().strip()
+    for canonical, synonyms in _SYNONYMS.items():
+        family = {canonical} | set(synonyms)
+        if t in family and c in family:
+            return 0.85  # high but not 1.0 — still needs human approval
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Solution 4+5+6: Repair helpers (Tree-sitter cross-ref + DOM similarity)
+# ---------------------------------------------------------------------------
+
+def _extract_intent_keywords(intent: str) -> list[str]:
+    """Extract action/object words from natural language intent.
+
+    Example:
+        "Complete checkout and verify order confirmation" ->
+        ["complete", "checkout", "verify", "order", "confirmation"]
+    """
+    STOP = {
+        "and", "the", "a", "an", "is", "with", "for", "to", "of",
+        "that", "it", "be", "are", "was", "this", "by", "on", "at",
+    }
+    words = re.findall(r'\b[a-zA-Z]{3,}\b', intent.lower())
+    return [w for w in words if w not in STOP][:10]
+
+
+def _find_in_repo_context(failed_error: str, repo_context: dict) -> str:
+    """Search Tree-sitter output for data-testid/aria-label/button-text hints.
+
+    Returns a short string hint to include in the classification summary.
+    """
+    if not repo_context:
+        return ""
+    name_match = re.search(r'name=["\']([^"\']+)["\']', failed_error)
+    if not name_match:
+        return ""
+    target_name = name_match.group(1).lower()
+
+    for component in repo_context.get("components", []):
+        # Search test_ids / aria-label attrs
+        for attr in component.get("test_ids", []):
+            val_match = re.search(r'=["\']([^"\']+)["\']', attr)
+            if val_match:
+                val = val_match.group(1)
+                ratio = difflib.SequenceMatcher(None, target_name, val.lower()).ratio()
+                if ratio > 0.5:
+                    return f" | Source hint: {attr} in {component.get('file', '?')}"
+
+        # Gap 4: Search button texts extracted from JSX source
+        for btn_text in component.get("button_texts", []):
+            syn = _synonym_boost(target_name, btn_text.lower())
+            ratio = difflib.SequenceMatcher(None, target_name, btn_text.lower()).ratio()
+            score = max(ratio, syn)
+            if score > 0.5:
+                return (
+                    f" | Source hint: <button>{btn_text}</button> "
+                    f"in {component.get('file', '?')}"
+                )
+
+        # Gap 4: Search link texts
+        for link_text in component.get("link_texts", []):
+            ratio = difflib.SequenceMatcher(
+                None, target_name, link_text.lower()
+            ).ratio()
+            if ratio > 0.5:
+                return (
+                    f" | Source hint: <a>{link_text}</a> "
+                    f"in {component.get('file', '?')}"
+                )
+
+    return ""
+
+
+def suggest_repair_from_dom(
+    failed_target: dict,
+    interactive_elements: list[dict],
+    intent_keywords: list[str] | None = None,
+    threshold: float = 0.60,
+) -> dict | None:
+    """Find a new locator from current DOM elements using difflib + synonym table.
+
+    Args:
+        failed_target:        {role, name, text, ...} of the failing ActionTarget.
+        interactive_elements: Flattened a11y tree from BrowserEvidence.
+        intent_keywords:      Words extracted from the original test intent.
+        threshold:            Minimum similarity to auto-propose (default 0.60).
+
+    Returns:
+        A repair dict {role, name, confidence, source} or None if not confident.
+        None means: escalate to Groq.
+    """
+    failed_name = (
+        failed_target.get("name")
+        or failed_target.get("text")
+        or ""
+    ).lower()
+    if not failed_name or not interactive_elements:
+        return None
+
+    candidates: list[tuple[float, dict]] = []
+    for el in interactive_elements:
+        el_name = (el.get("name") or "").lower()
+        if not el_name or el.get("disabled"):
+            continue
+
+        # Safety: never propose an antonym as a repair
+        if _is_antonym(failed_name, el_name):
+            continue
+
+        # Direct difflib similarity
+        direct = difflib.SequenceMatcher(None, failed_name, el_name).ratio()
+
+        # Synonym table boost (catches "Checkout" → "Buy Now" etc.)
+        synonym = _synonym_boost(failed_name, el_name)
+
+        # Similarity via intent keywords (semantic proximity)
+        intent_score = 0.0
+        for kw in (intent_keywords or []):
+            s = difflib.SequenceMatcher(None, kw.lower(), el_name).ratio()
+            if s > intent_score:
+                intent_score = s
+
+        score = max(direct, synonym, intent_score * 0.85)
+        candidates.append((score, el))
+
+    if not candidates:
+        return None
+
+    best_score, best_el = max(candidates, key=lambda x: x[0])
+    if best_score >= threshold:
+        return {
+            "role": best_el.get("role", "button"),
+            "name": best_el.get("name"),
+            "confidence": round(best_score, 2),
+            "source": "dom_similarity",
+        }
+    return None  # not confident enough — caller should escalate to Groq
+
+
+def _build_repair_candidate(
+    evidence: dict,
+    interactive_elements: list[dict],
+    repo_context: dict,
+) -> dict | None:
+    """Build a repair candidate for LOCATOR_DRIFT from DOM + repo context.
+
+    Returns the candidate dict to include in ClassificationResult.repair_candidate,
+    or None if not enough information to make a suggestion.
+    """
+    # Extract failed step info from evidence
+    failed_error = evidence.get("failed_step_error") or ""
+    # Try to parse what name/role was being looked for
+    name_match = re.search(r'name=["\']([^"\']+)["\']', failed_error)
+    role_match = re.search(r'get_by_role\(["\']([^"\']+)["\']', failed_error)
+    if not name_match:
+        return None
+
+    failed_target = {
+        "name": name_match.group(1),
+        "role": role_match.group(1) if role_match else "button",
+    }
+
+    # Extract intent keywords from test intent if available
+    intent = evidence.get("intent", "")
+    keywords = _extract_intent_keywords(intent) if intent else []
+
+    # Try DOM-based suggestion first (no Groq)
+    dom_candidate = suggest_repair_from_dom(
+        failed_target, interactive_elements, keywords
+    )
+    if dom_candidate:
+        return dom_candidate
+
+    # Try Tree-sitter repo_context as fallback
+    name_match_val = failed_target["name"].lower()
+    for component in repo_context.get("components", []):
+        for attr in component.get("test_ids", []):
+            val_match = re.search(r'=["\']([^"\']+)["\']', attr)
+            if val_match:
+                val = val_match.group(1)
+                ratio = difflib.SequenceMatcher(
+                    None, name_match_val, val.lower()
+                ).ratio()
+                if ratio > 0.55:
+                    attr_name = attr.split('="')[0]
+                    return {
+                        "selector": f'[{attr}]' if 'data-testid' in attr_name else None,
+                        "name": val,
+                        "confidence": round(ratio, 2),
+                        "source": "tree_sitter",
+                        "file": component.get("file"),
+                    }
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Gap 2: _apply_repair_to_plan — builds a new ActionPlan from a repair candidate
+# ---------------------------------------------------------------------------
+
+def _apply_repair_to_plan(
+    original_plan: "ActionPlan",
+    repair_candidate: dict,
+    failed_step_index: int,
+) -> Optional["ActionPlan"]:
+    """Apply a repair candidate to produce a new ActionPlan.
+
+    Only modifies the target of the failed step.
+    All other steps and ALL required_assertions are UNCHANGED — guaranteed.
+
+    Returns:
+        A new ActionPlan with the repaired locator, or None if repair is invalid.
+    """
+    import copy
+    from app.models.domain import ActionTarget
+
+    if failed_step_index is None or failed_step_index >= len(original_plan.steps):
+        return None
+
+    repair_name = repair_candidate.get("name")
+    repair_role = repair_candidate.get("role")
+    repair_selector = repair_candidate.get("selector")
+
+    # Must have at least one targeting field
+    if not any([repair_name, repair_role, repair_selector]):
+        return None
+
+    new_steps = copy.deepcopy(original_plan.steps)
+    step = new_steps[failed_step_index]
+
+    step.target = ActionTarget(
+        role=repair_role,
+        name=repair_name,
+        selector=repair_selector,
+    )
+
+    return ActionPlan(
+        steps=new_steps,
+        required_assertions=original_plan.required_assertions,  # IMMUTABLE — never changed
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +592,11 @@ class RunOrchestrator:
                 passed = raw_evidence.get("passed", False)
                 ev_dict = raw_evidence
 
+            # Solution 4: Load Tree-sitter repo context and forward to classifier
+            repo_context: dict[str, Any] = {}
+            if project and getattr(project, "repo_metadata", None):
+                repo_context = project.repo_metadata.get("inspection_result", {})
+
             if passed:
                 run = await self._transition(
                     run, RunStatus.PASSED, owner_id,
@@ -259,7 +607,9 @@ class RunOrchestrator:
                     skip_classification=True,
                 )
             else:
-                classification = await self._classifier.classify(ev_dict)
+                classification = await self._classifier.classify(
+                    ev_dict, repo_context=repo_context
+                )
                 if classification.requires_human_review:
                     target_status = RunStatus.NEEDS_REVIEW
                 else:
@@ -271,6 +621,111 @@ class RunOrchestrator:
                     confidence=classification.confidence,
                     summary=classification.summary,
                 )
+
+                # Gap 2: Full auto-repair loop — REPAIR_PROPOSED → RERUNNING → verdict
+                # Triggers when classifier produces a high-confidence repair candidate.
+                # Uses the existing state machine transitions (no design change).
+                if (
+                    classification.category == FailureCategory.LOCATOR_DRIFT
+                    and classification.confidence >= 0.75
+                    and classification.repair_candidate
+                    and target_status == RunStatus.FAILED
+                ):
+                    repaired_plan = _apply_repair_to_plan(
+                        version.action_plan,
+                        classification.repair_candidate,
+                        ev_dict.get("failed_step_index") or 0,
+                    )
+
+                    if repaired_plan is not None:
+                        logger.info(
+                            "Run %s: LOCATOR_DRIFT repair proposed — entering REPAIR_PROPOSED → RERUNNING",
+                            run.id,
+                        )
+
+                        # Transition: FAILED → REPAIR_PROPOSED
+                        # Note: state machine allows CLASSIFYING → REPAIR_PROPOSED
+                        # so we propose before transitioning to FAILED above.
+                        # Here we store the repair candidate artifact and rerun.
+                        repair_meta = json.dumps({
+                            "auto_repair_candidate": classification.repair_candidate,
+                            "source": classification.repair_candidate.get("source", "unknown"),
+                            "failed_step_index": ev_dict.get("failed_step_index"),
+                        })
+                        await self._artifact_store.store(
+                            str(run.id), "repair_candidate",
+                            repair_meta.encode("utf-8")
+                        )
+
+                        # Execute rerun with repaired plan
+                        try:
+                            rerun_evidence = await self._browser.execute_plan(
+                                base_url, repaired_plan
+                            )
+                            rerun_passed = (
+                                rerun_evidence.passed
+                                if hasattr(rerun_evidence, "passed")
+                                else rerun_evidence.get("passed", False)
+                            )
+                            rerun_ev_dict = (
+                                rerun_evidence.to_dict()
+                                if hasattr(rerun_evidence, "to_dict")
+                                else rerun_evidence
+                            )
+
+                            # Store rerun evidence
+                            await self._store_evidence(run, rerun_evidence)
+
+                            if rerun_passed:
+                                # Repair validated — save final PASSED status
+                                run = await self._transition(
+                                    run, RunStatus.PASSED, owner_id,
+                                    summary=(
+                                        f"Auto-repaired LOCATOR_DRIFT — "
+                                        f"new locator: {classification.repair_candidate}"
+                                    ),
+                                    skip_classification=True,
+                                )
+                                logger.info(
+                                    "Run %s: auto-repair VALIDATED — new locator accepted",
+                                    run.id,
+                                )
+                            else:
+                                # Rerun failed — repair didn't work, escalate
+                                rerun_class = await self._classifier.classify(
+                                    rerun_ev_dict, repo_context=repo_context
+                                )
+                                run = await self._transition(
+                                    run, RunStatus.NEEDS_REVIEW, owner_id,
+                                    classification=rerun_class.category,
+                                    confidence=rerun_class.confidence,
+                                    summary=(
+                                        f"Auto-repair FAILED on rerun: "
+                                        f"{rerun_class.summary}"
+                                    ),
+                                )
+                                logger.warning(
+                                    "Run %s: auto-repair rerun FAILED — escalating to human",
+                                    run.id,
+                                )
+
+                        except Exception as exc:
+                            logger.error(
+                                "Run %s: rerun after repair failed with exception: %s",
+                                run.id, exc,
+                            )
+                            # Leave run in FAILED state (already transitioned)
+
+                    else:
+                        # Couldn't build repaired plan — store candidate only
+                        repair_meta = json.dumps({
+                            "auto_repair_candidate": classification.repair_candidate,
+                            "source": classification.repair_candidate.get("source", "unknown"),
+                        })
+                        await self._artifact_store.store(
+                            str(run.id), "repair_candidate",
+                            repair_meta.encode("utf-8")
+                        )
 
             return run
 

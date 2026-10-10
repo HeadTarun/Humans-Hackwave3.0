@@ -15,6 +15,7 @@ Evidence collected per-run:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -44,10 +45,13 @@ class BrowserEvidence:
     assertion_results: list[dict]         # Per-assertion {type, passed, detail}
     screenshots: list[bytes]              # PNG bytes per step (may be empty in CI)
     console_errors: list[str]
-    network_failures: list[dict]          # {url, status, method}
+    network_failures: list[dict]          # {url, status, method, response_body?}
     dom_snapshot: Optional[str]           # Final page HTML, truncated
     page_url: str                         # Final URL after plan execution
     timing_ms: int                        # Total wall-clock ms
+    # --- Adaptive healing additions ---
+    interactive_elements: list[dict] = field(default_factory=list)  # [{role, name}] from a11y tree
+    accessibility_tree: Optional[str] = None  # JSON-encoded a11y snapshot (bounded)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to evidence dict (screenshots as length counts, not raw bytes)."""
@@ -64,7 +68,53 @@ class BrowserEvidence:
             "dom_snapshot_chars": len(self.dom_snapshot) if self.dom_snapshot else 0,
             "page_url": self.page_url,
             "timing_ms": self.timing_ms,
+            # Adaptive context — used by classifier and repair planner
+            "interactive_elements": self.interactive_elements,
+            "accessibility_tree": self.accessibility_tree,
         }
+
+
+# ---------------------------------------------------------------------------
+# Accessibility tree helpers (Solution 1)
+# ---------------------------------------------------------------------------
+
+_INTERACTIVE_ROLES = frozenset({
+    "button", "link", "checkbox", "radio", "textbox", "searchbox",
+    "combobox", "listbox", "option", "menuitem", "tab", "switch",
+    "spinbutton", "slider", "treeitem", "gridcell",
+})
+
+
+def _flatten_a11y_tree(node: Any, results: list | None = None) -> list[dict]:
+    """Recursively flatten a Playwright accessibility snapshot into a list of
+    interactive elements: [{role, name, focused, disabled}].
+
+    Only returns nodes with roles that are user-actionable — exactly what
+    Playwright's get_by_role() and get_by_label() use for locator resolution.
+    Bounded to 50 elements maximum.
+    """
+    if results is None:
+        results = []
+    if not node or len(results) >= 50:
+        return results
+
+    role = (node.get("role") or "").lower()
+    name = (node.get("name") or "").strip()
+
+    if role in _INTERACTIVE_ROLES and name:
+        results.append({
+            "role": role,
+            "name": name,
+            "focused": node.get("focused", False),
+            "disabled": node.get("disabled", False),
+        })
+
+    for child in node.get("children") or []:
+        _flatten_a11y_tree(child, results)
+        if len(results) >= 50:
+            break
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +146,8 @@ class PlaywrightBrowserRunner(BrowserRunner):
         console_errors: list[str] = []
         network_failures: list[dict] = []
         assertion_results: list[dict] = []
+        interactive_elements: list[dict] = []
+        accessibility_tree: Optional[str] = None
         steps_executed = 0
         steps_failed = 0
         failed_step_index: Optional[int] = None
@@ -115,15 +167,35 @@ class PlaywrightBrowserRunner(BrowserRunner):
             page.on("console", lambda msg: console_errors.append(msg.text)
                     if msg.type in ("error", "warning") else None)
 
-            # Collect network failures
-            page.on(
-                "response",
-                lambda resp: network_failures.append({
-                    "url": resp.url,
-                    "status": resp.status,
-                    "method": resp.request.method,
-                }) if resp.status >= 400 else None,
-            )
+            # Solution 2: Capture response body for 4xx/5xx (bounded at 1KB)
+            async def _on_response(resp: Any) -> None:
+                if resp.status >= 400:
+                    try:
+                        body = (await resp.text())[:1000]
+                    except Exception:
+                        body = ""
+                    network_failures.append({
+                        "url": resp.url,
+                        "status": resp.status,
+                        "method": resp.request.method,
+                        "response_body": body,
+                    })
+
+            page.on("response", lambda r: asyncio.ensure_future(_on_response(r)))
+
+            # Gap 3a: Capture requests that never got a response
+            # (DNS failure, connection refused, infra down)
+            # These are ENVIRONMENT_FAILURE, not LOCATOR_DRIFT
+            def _on_request_failed(req: Any) -> None:
+                network_failures.append({
+                    "url": req.url,
+                    "status": 0,          # no HTTP status — never connected
+                    "method": req.method,
+                    "response_body": "",
+                    "failure_text": getattr(req, "failure", "request_failed"),
+                })
+
+            page.on("requestfailed", _on_request_failed)
 
             try:
                 # Execute steps
@@ -159,6 +231,16 @@ class PlaywrightBrowserRunner(BrowserRunner):
                 except Exception:
                     dom_snapshot = None
 
+                # Solution 1: Accessibility tree snapshot for adaptive healing
+                # Gives exact {role, name} pairs matching get_by_role() locators
+                try:
+                    a11y_raw = await page.accessibility.snapshot()
+                    if a11y_raw:
+                        accessibility_tree = json.dumps(a11y_raw, default=str)[:10_000]
+                        interactive_elements = _flatten_a11y_tree(a11y_raw)
+                except Exception as exc:
+                    logger.debug("Accessibility snapshot failed: %s", exc)
+
                 # Evaluate required assertions
                 assertion_results = await self._evaluate_assertions(
                     page, plan.required_assertions
@@ -184,6 +266,8 @@ class PlaywrightBrowserRunner(BrowserRunner):
             dom_snapshot=dom_snapshot,
             page_url=page_url,
             timing_ms=timing_ms,
+            interactive_elements=interactive_elements,
+            accessibility_tree=accessibility_tree,
         )
 
     # ------------------------------------------------------------------
@@ -206,6 +290,13 @@ class PlaywrightBrowserRunner(BrowserRunner):
             if url.startswith("/"):
                 url = base_url.rstrip("/") + url
             await page.goto(url, timeout=timeout, wait_until="domcontentloaded")
+            # Gap 3b: Wait for network to settle so SPA buttons are fully rendered.
+            # Eliminates false LOCATOR_DRIFT on React/Next.js apps that lazily
+            # enable buttons after data fetch. Timeout is soft — streaming pages OK.
+            try:
+                await page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass  # networkidle may timeout on streaming/SSE pages — that's OK
 
         elif action == ActionType.CLICK:
             locator = self._resolve_locator(page, target)
