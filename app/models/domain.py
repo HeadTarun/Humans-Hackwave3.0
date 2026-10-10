@@ -40,13 +40,18 @@ class FailureCategory(str, Enum):
 
 
 class ArtifactType(str, Enum):
-    """Types of evidence artifacts."""
-    SCREENSHOT = "screenshot"
-    TRACE = "trace"
-    DOM_SNAPSHOT = "dom_snapshot"
-    CONSOLE_LOG = "console_log"
-    NETWORK_LOG = "network_log"
-    REPORT = "report"
+    """Types of evidence artifacts.
+    Must stay in sync with evidence_artifacts.artifact_type CHECK constraint (migration 003).
+    """
+    SCREENSHOT             = "screenshot"
+    TRACE                  = "trace"
+    DOM_SNAPSHOT           = "dom_snapshot"
+    CONSOLE_LOG            = "console_log"
+    NETWORK_LOG            = "network_log"
+    REPORT                 = "report"
+    # Adaptive healing additions (migration 003)
+    REPAIR_CANDIDATE       = "repair_candidate"       # auto-repair candidate JSON
+    ACCESSIBILITY_SNAPSHOT = "accessibility_snapshot" # Playwright a11y tree JSON
 
 
 class RepairValidationStatus(str, Enum):
