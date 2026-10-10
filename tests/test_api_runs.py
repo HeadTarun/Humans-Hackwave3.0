@@ -1,4 +1,12 @@
-"""API tests for the run lifecycle."""
+"""API tests for the run lifecycle.
+
+Phase 3 changes:
+  - POST /tests/{id}/runs now orchestrates the full lifecycle and returns a
+    terminal-state run (passed when FakeBrowserRunner is injected by conftest).
+  - Transition tests use `queued_run_id` (a run created directly in QUEUED state
+    via the repository, bypassing the orchestrator route).
+  - `run_id` returns a completed (passed) run — used by GET tests only.
+"""
 import pytest
 from tests.conftest import HEADERS, OTHER_HEADERS, MINIMAL_ACTION_PLAN
 
@@ -8,9 +16,18 @@ class TestCreateRun:
         r = client.post(f"/tests/{test_id_with_version}/runs", json={}, headers=HEADERS)
         assert r.status_code == 201
 
-    def test_run_starts_as_queued(self, client, test_id_with_version):
+    def test_run_reaches_terminal_state(self, client, test_id_with_version):
+        """Phase 3: POST /runs orchestrates the full lifecycle synchronously.
+        With FakeBrowserRunner(should_pass=True) injected, the run ends as 'passed'.
+        """
         r = client.post(f"/tests/{test_id_with_version}/runs", json={}, headers=HEADERS)
-        assert r.json()["status"] == "queued"
+        data = r.json()
+        assert data["status"] in {"passed", "failed", "needs_review", "environment_failed"}
+
+    def test_run_reaches_passed_with_passing_browser(self, client, test_id_with_version):
+        """With default FakeBrowserRunner(should_pass=True), run ends as 'passed'."""
+        r = client.post(f"/tests/{test_id_with_version}/runs", json={}, headers=HEADERS)
+        assert r.json()["status"] == "passed"
 
     def test_run_pinned_to_active_version(self, client, test_id_with_version):
         test_r = client.get(f"/tests/{test_id_with_version}", headers=HEADERS)
@@ -37,6 +54,22 @@ class TestCreateRun:
         )
         assert r.status_code == 404
 
+    def test_run_has_timestamps(self, client, test_id_with_version):
+        """Completed run must have started_at and finished_at set."""
+        r = client.post(f"/tests/{test_id_with_version}/runs", json={}, headers=HEADERS)
+        data = r.json()
+        assert data["started_at"] is not None
+        assert data["finished_at"] is not None
+
+    def test_start_command_accepted(self, client, test_id_with_version):
+        """start_command in request body is accepted (no error)."""
+        r = client.post(
+            f"/tests/{test_id_with_version}/runs",
+            json={"start_command": "npm run dev"},
+            headers=HEADERS,
+        )
+        assert r.status_code == 201
+
 
 class TestGetRun:
     def test_get_run_returns_200(self, client, run_id):
@@ -53,30 +86,35 @@ class TestGetRun:
 
 
 class TestRunTransitions:
+    """Manual transition tests. Use `queued_run_id` (bypasses orchestrator).
+
+    The /transition endpoint still exists for repair flows and admin use.
+    """
+
     def _transition(self, client, run_id, status, extra=None):
         body = {"status": status, **(extra or {})}
         return client.post(f"/runs/{run_id}/transition", json=body, headers=HEADERS)
 
-    def test_queued_to_preparing(self, client, run_id):
-        r = self._transition(client, run_id, "preparing")
+    def test_queued_to_preparing(self, client, queued_run_id):
+        r = self._transition(client, queued_run_id, "preparing")
         assert r.status_code == 200
         assert r.json()["status"] == "preparing"
 
-    def test_started_at_set_on_first_transition(self, client, run_id):
-        r = self._transition(client, run_id, "preparing")
+    def test_started_at_set_on_first_transition(self, client, queued_run_id):
+        r = self._transition(client, queued_run_id, "preparing")
         assert r.json()["started_at"] is not None
 
-    def test_invalid_transition_returns_409(self, client, run_id):
+    def test_invalid_transition_returns_409(self, client, queued_run_id):
         # queued → passed is not a valid transition
-        r = self._transition(client, run_id, "passed")
+        r = self._transition(client, queued_run_id, "passed")
         assert r.status_code == 409
 
-    def test_skip_step_returns_409(self, client, run_id):
+    def test_skip_step_returns_409(self, client, queued_run_id):
         # queued → running skips preparing
-        r = self._transition(client, run_id, "running")
+        r = self._transition(client, queued_run_id, "running")
         assert r.status_code == 409
 
-    def test_full_happy_path(self, client, run_id):
+    def test_full_happy_path(self, client, queued_run_id):
         transitions = [
             ("preparing", None),
             ("running", None),
@@ -85,23 +123,23 @@ class TestRunTransitions:
             ("passed", None),
         ]
         for status, extra in transitions:
-            r = self._transition(client, run_id, status, extra)
+            r = self._transition(client, queued_run_id, status, extra)
             assert r.status_code == 200, f"Failed at {status}: {r.json()}"
             assert r.json()["status"] == status
 
-    def test_failed_requires_classification(self, client, run_id):
+    def test_failed_requires_classification(self, client, queued_run_id):
         # Walk to classifying first
         for s in ["preparing", "running", "collecting_evidence", "classifying"]:
-            self._transition(client, run_id, s)
+            self._transition(client, queued_run_id, s)
         # Failed without classification should be rejected
-        r = self._transition(client, run_id, "failed")
+        r = self._transition(client, queued_run_id, "failed")
         assert r.status_code == 422
 
-    def test_failed_with_classification_succeeds(self, client, run_id):
+    def test_failed_with_classification_succeeds(self, client, queued_run_id):
         for s in ["preparing", "running", "collecting_evidence", "classifying"]:
-            self._transition(client, run_id, s)
+            self._transition(client, queued_run_id, s)
         r = self._transition(
-            client, run_id, "failed",
+            client, queued_run_id, "failed",
             {"classification": "LOCATOR_DRIFT", "confidence": 0.9, "summary": "Button moved"},
         )
         assert r.status_code == 200
@@ -112,39 +150,35 @@ class TestRunTransitions:
         assert data["finished_at"] is not None
 
     def test_terminal_state_cannot_transition(self, client, run_id):
-        # Walk to passed
-        for s in ["preparing", "running", "collecting_evidence", "classifying", "passed"]:
-            self._transition(client, run_id, s)
-        # Try to transition again — should be rejected
+        # run_id is already in PASSED (terminal) state
         r = self._transition(client, run_id, "preparing")
         assert r.status_code == 409
 
-    def test_repair_lifecycle(self, client, test_id_with_version):
+    def test_repair_lifecycle(self, client, queued_run_id):
         """Test the repair proposal → rerunning → passed path."""
-        run_r = client.post(
-            f"/tests/{test_id_with_version}/runs", json={}, headers=HEADERS
-        )
-        run_id = run_r.json()["id"]
-
         for s in ["preparing", "running", "collecting_evidence", "classifying"]:
-            client.post(f"/runs/{run_id}/transition", json={"status": s}, headers=HEADERS)
+            client.post(
+                f"/runs/{queued_run_id}/transition",
+                json={"status": s},
+                headers=HEADERS,
+            )
 
         r = client.post(
-            f"/runs/{run_id}/transition",
+            f"/runs/{queued_run_id}/transition",
             json={"status": "repair_proposed"},
             headers=HEADERS,
         )
         assert r.status_code == 200
 
         r = client.post(
-            f"/runs/{run_id}/transition",
+            f"/runs/{queued_run_id}/transition",
             json={"status": "rerunning"},
             headers=HEADERS,
         )
         assert r.status_code == 200
 
         r = client.post(
-            f"/runs/{run_id}/transition",
+            f"/runs/{queued_run_id}/transition",
             json={"status": "passed"},
             headers=HEADERS,
         )

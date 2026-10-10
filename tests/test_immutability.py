@@ -66,13 +66,9 @@ class TestRepairProposalIntegrity:
             client.post(f"/runs/{run_id}/transition", json={"status": s}, headers=HEADERS)
 
     def test_repair_proposal_rejected_if_fewer_assertions(
-        self, client, test_id_with_version
+        self, client, queued_run_id
     ):
-        run_r = client.post(
-            f"/tests/{test_id_with_version}/runs", json={}, headers=HEADERS
-        )
-        run_id = run_r.json()["id"]
-        self._walk_to_repair_proposed(client, run_id)
+        self._walk_to_repair_proposed(client, queued_run_id)
 
         # Proposal with NO assertions — should be rejected
         weakened_plan = {
@@ -80,7 +76,7 @@ class TestRepairProposalIntegrity:
             "required_assertions": [],  # Empty — weakening the assertions
         }
         r = client.post(
-            f"/runs/{run_id}/repair-proposals",
+            f"/runs/{queued_run_id}/repair-proposals",
             json={
                 "proposed_plan": weakened_plan,
                 "reason": "Tried to remove assertions",
@@ -94,7 +90,7 @@ class TestRepairProposalIntegrity:
     def test_repair_proposal_requires_repair_proposed_status(
         self, client, run_id
     ):
-        """Cannot create a proposal on a queued run — must be repair_proposed status."""
+        """Cannot create a proposal on a terminal (passed) run."""
         valid_plan = {
             "steps": [{"action": "navigate", "target": "http://localhost"}],
             "required_assertions": [{"type": "visible", "target": {"text": "OK"}}],
@@ -107,21 +103,17 @@ class TestRepairProposalIntegrity:
         assert r.status_code == 409
 
     def test_approve_requires_validated_pass_status(
-        self, client, test_id_with_version
+        self, client, queued_run_id
     ):
         """Cannot approve a proposal that hasn't been validated yet."""
-        run_r = client.post(
-            f"/tests/{test_id_with_version}/runs", json={}, headers=HEADERS
-        )
-        run_id = run_r.json()["id"]
-        self._walk_to_repair_proposed(client, run_id)
+        self._walk_to_repair_proposed(client, queued_run_id)
 
         valid_plan = {
             "steps": [{"action": "navigate", "target": "http://localhost"}],
             "required_assertions": [{"type": "visible", "target": {"text": "Order confirmed"}}],
         }
         proposal_r = client.post(
-            f"/runs/{run_id}/repair-proposals",
+            f"/runs/{queued_run_id}/repair-proposals",
             json={"proposed_plan": valid_plan, "reason": "fix locator", "confidence": 0.85},
             headers=HEADERS,
         )
