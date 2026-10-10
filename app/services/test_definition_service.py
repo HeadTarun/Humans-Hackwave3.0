@@ -68,6 +68,10 @@ class TestDefinitionService:
                 created_by=owner_id,
                 change_reason="Initial version",
             )
+            # Re-read so active_version_id is reflected in the returned object
+            refreshed = await self._repo.get_test_definition(test_def.id, owner_id)
+            if refreshed:
+                test_def = refreshed
 
         return test_def, version
 
