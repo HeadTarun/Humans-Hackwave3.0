@@ -29,6 +29,8 @@ from typing import Any, Optional
 from fastapi import HTTPException
 
 from app.models.domain import (
+    ActionPlan,
+    ActionTarget,
     ArtifactType,
     EvidenceArtifact,
     FailureCategory,
@@ -432,7 +434,6 @@ def _apply_repair_to_plan(
         A new ActionPlan with the repaired locator, or None if repair is invalid.
     """
     import copy
-    from app.models.domain import ActionTarget
 
     if failed_step_index is None or failed_step_index >= len(original_plan.steps):
         return None
