@@ -15,7 +15,14 @@ import logging
 
 import jwt
 from fastapi import Depends, Header, HTTPException
-from jwt import PyJWTError
+
+try:
+    from jwt import PyJWTError  # PyJWT package
+except ImportError:
+    # Plain 'jwt' package — no PyJWTError; use a local alias
+    class PyJWTError(Exception):  # type: ignore[no-redef]
+        """Compatibility shim when plain 'jwt' is installed instead of PyJWT."""
+        pass
 
 from app.config import Settings, get_settings
 from app.persistence.in_memory import InMemoryRepository
