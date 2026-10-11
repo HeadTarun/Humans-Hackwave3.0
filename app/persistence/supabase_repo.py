@@ -74,6 +74,16 @@ class SupabaseRepository(PersistenceRepository):
             return None
         return Project(**result.data[0])
 
+    async def list_projects(self, owner_id: str) -> list[Project]:
+        result = await asyncio.to_thread(
+            lambda: self._client.table("projects")
+            .select("*")
+            .eq("owner_id", owner_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
+        return [Project(**row) for row in result.data]
+
     async def update_project_metadata(
         self, project_id: uuid.UUID, repo_metadata: dict, owner_id: str
     ) -> None:
@@ -109,6 +119,19 @@ class SupabaseRepository(PersistenceRepository):
         if not result.data:
             return None
         return TestDefinition(**result.data[0])
+
+    async def list_test_definitions(
+        self, project_id: uuid.UUID, owner_id: str
+    ) -> list[TestDefinition]:
+        result = await asyncio.to_thread(
+            lambda: self._client.table("test_definitions")
+            .select("*")
+            .eq("project_id", str(project_id))
+            .eq("owner_id", owner_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
+        return [TestDefinition(**row) for row in result.data]
 
     async def update_active_version(
         self, test_id: uuid.UUID, version_id: uuid.UUID, owner_id: str

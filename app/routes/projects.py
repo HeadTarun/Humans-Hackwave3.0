@@ -6,10 +6,22 @@ from fastapi import APIRouter, Depends, HTTPException
 from app.dependencies import get_owner_id, get_repository
 from app.models.domain import Project
 from app.models.requests import CreateProjectRequest
-from app.models.responses import ProjectResponse
+from app.models.responses import ProjectListResponse, ProjectResponse
 from app.persistence.repository import PersistenceRepository
 
 router = APIRouter()
+
+
+@router.get("", response_model=ProjectListResponse)
+async def list_projects(
+    owner_id: str = Depends(get_owner_id),
+    repo: PersistenceRepository = Depends(get_repository),
+) -> ProjectListResponse:
+    projects = await repo.list_projects(owner_id)
+    return ProjectListResponse(
+        total=len(projects),
+        projects=[ProjectResponse(**p.model_dump()) for p in projects],
+    )
 
 
 @router.post("", response_model=ProjectResponse, status_code=201)

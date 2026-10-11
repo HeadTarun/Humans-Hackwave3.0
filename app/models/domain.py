@@ -182,6 +182,7 @@ class Project(BaseModel):
 
 class TestDefinition(BaseModel):
     """Test definition with immutable natural-language intent and required assertions."""
+    __test__ = False
     id: uuid.UUID = Field(default_factory=uuid.uuid4)
     project_id: uuid.UUID
     owner_id: str
@@ -200,6 +201,7 @@ class TestVersion(BaseModel):
     Generated Playwright steps/locators live here — NOT in the test definition.
     Repairs create new versions; they never modify existing ones.
     """
+    __test__ = False
     id: uuid.UUID = Field(default_factory=uuid.uuid4)
     test_definition_id: uuid.UUID
     version_number: int = Field(ge=1)
@@ -213,6 +215,7 @@ class TestVersion(BaseModel):
 
 class TestRun(BaseModel):
     """A single test execution record. Append-only — never overwrite evidence."""
+    __test__ = False
     id: uuid.UUID = Field(default_factory=uuid.uuid4)
     test_definition_id: uuid.UUID
     test_version_id: uuid.UUID

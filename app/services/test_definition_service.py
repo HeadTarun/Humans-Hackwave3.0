@@ -92,6 +92,25 @@ class TestDefinitionService:
 
         return test_def, version
 
+    async def list_tests(
+        self, project_id: uuid.UUID, owner_id: str
+    ) -> list[tuple[TestDefinition, TestVersion | None]]:
+        """Fetch all test definitions for a project with their active versions."""
+        project = await self._repo.get_project(project_id, owner_id)
+        if not project:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Project {project_id} not found or access denied",
+            )
+        definitions = await self._repo.list_test_definitions(project_id, owner_id)
+        results: list[tuple[TestDefinition, TestVersion | None]] = []
+        for td in definitions:
+            version: TestVersion | None = None
+            if td.active_version_id:
+                version = await self._repo.get_test_version(td.active_version_id)
+            results.append((td, version))
+        return results
+
     async def create_version(
         self,
         test_id: uuid.UUID,

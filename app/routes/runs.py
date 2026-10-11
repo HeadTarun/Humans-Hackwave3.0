@@ -5,6 +5,7 @@ is configured. When E2B is not set (local dev / tests), the orchestrator still
 runs with FakeSandboxRunner + FakeBrowserRunner, driving the full state machine
 automatically from a single API call.
 """
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends
@@ -18,17 +19,59 @@ from app.dependencies import (
     get_sandbox_runner,
 )
 from app.models.requests import CreateRunRequest, TransitionRunRequest
-from app.models.responses import RunHistoryResponse, RunResponse
+from app.models.responses import (
+    ArtifactListResponse,
+    EvidenceArtifactWithUrlResponse,
+    RunHistoryResponse,
+    RunResponse,
+)
 from app.persistence.repository import PersistenceRepository
 from app.services.interfaces import ArtifactStore, BrowserRunner, SandboxRunner
 from app.services.run_orchestrator import DeterministicClassifier, RunOrchestrator
 from app.services.test_run_service import TestRunService
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
 def _make_service(repo: PersistenceRepository) -> TestRunService:
     return TestRunService(repo)
+
+
+@router.get(
+    "/runs/{run_id}/artifacts",
+    response_model=ArtifactListResponse,
+    tags=["runs"],
+)
+async def get_run_artifacts(
+    run_id: uuid.UUID,
+    owner_id: str = Depends(get_owner_id),
+    repo: PersistenceRepository = Depends(get_repository),
+    artifact_store: ArtifactStore = Depends(get_artifact_store),
+) -> ArtifactListResponse:
+    svc = _make_service(repo)
+    # Verifies run exists and belongs to this owner
+    await svc.get_run(run_id, owner_id)
+    artifacts = await repo.get_artifacts_for_run(run_id)
+
+    responses: list[EvidenceArtifactWithUrlResponse] = []
+    for a in artifacts:
+        url = None
+        try:
+            url = await artifact_store.get_signed_url(a.storage_path)
+        except Exception as exc:
+            logger.warning("Could not generate signed URL for artifact %s: %s", a.id, exc)
+        responses.append(
+            EvidenceArtifactWithUrlResponse(
+                **a.model_dump(),
+                url=url,
+            )
+        )
+    return ArtifactListResponse(
+        test_run_id=run_id,
+        total=len(responses),
+        artifacts=responses,
+    )
 
 
 @router.post(

@@ -31,6 +31,9 @@ class PersistenceRepository(ABC):
     async def get_project(self, project_id: uuid.UUID, owner_id: str) -> Project | None: ...
 
     @abstractmethod
+    async def list_projects(self, owner_id: str) -> list[Project]: ...
+
+    @abstractmethod
     async def update_project_metadata(
         self, project_id: uuid.UUID, repo_metadata: dict, owner_id: str
     ) -> None: ...
@@ -45,6 +48,11 @@ class PersistenceRepository(ABC):
     async def get_test_definition(
         self, test_id: uuid.UUID, owner_id: str
     ) -> TestDefinition | None: ...
+
+    @abstractmethod
+    async def list_test_definitions(
+        self, project_id: uuid.UUID, owner_id: str
+    ) -> list[TestDefinition]: ...
 
     @abstractmethod
     async def update_active_version(

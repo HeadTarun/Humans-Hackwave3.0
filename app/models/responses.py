@@ -92,6 +92,39 @@ class RunHistoryResponse(BaseModel):
     runs: list[RunResponse]
 
 
+class ProjectListResponse(BaseModel):
+    total: int
+    projects: list[ProjectResponse]
+
+
+class TestDefinitionListResponse(BaseModel):
+    project_id: uuid.UUID
+    total: int
+    tests: list[TestDefinitionResponse]
+
+
+class EvidenceArtifactWithUrlResponse(BaseModel):
+    id: uuid.UUID
+    test_run_id: uuid.UUID
+    artifact_type: ArtifactType
+    storage_path: str
+    url: Optional[str] = None
+    metadata: Optional[dict[str, Any]] = None
+    created_at: datetime
+
+
+class ArtifactListResponse(BaseModel):
+    test_run_id: uuid.UUID
+    total: int
+    artifacts: list[EvidenceArtifactWithUrlResponse]
+
+
+class RepairProposalListResponse(BaseModel):
+    test_run_id: uuid.UUID
+    total: int
+    proposals: list[RepairProposalResponse]
+
+
 class ErrorResponse(BaseModel):
     detail: str
     request_id: Optional[str] = None

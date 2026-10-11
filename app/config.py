@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     app_env: str = Field(default="development")
     app_debug: bool = Field(default=False)
     app_secret_key: str = Field(default="change-me-in-production")
+    host: str = Field(default="0.0.0.0")
+    port: int = Field(default=8000)
+    cors_origins: str = Field(default="*")
 
     # Phase 3+
     groq_api_key: str = Field(default="")
@@ -51,6 +54,12 @@ class Settings(BaseSettings):
     def is_e2b_configured(self) -> bool:
         """Return True if E2B API key is set — required for real sandbox execution."""
         return bool(self.e2b_api_key)
+
+    def get_cors_origins(self) -> list[str]:
+        """Return parsed list of CORS origins."""
+        if not self.cors_origins or self.cors_origins == "*":
+            return ["*"]
+        return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
 
 
 @lru_cache

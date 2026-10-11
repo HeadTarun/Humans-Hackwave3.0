@@ -42,6 +42,13 @@ class InMemoryRepository(PersistenceRepository):
         # Simulates RLS: owner_id = auth.uid()
         return p if (p and p.owner_id == owner_id) else None
 
+    async def list_projects(self, owner_id: str) -> list[Project]:
+        return sorted(
+            [p for p in self._projects.values() if p.owner_id == owner_id],
+            key=lambda p: p.created_at,
+            reverse=True,
+        )
+
     async def update_project_metadata(
         self, project_id: uuid.UUID, repo_metadata: dict, owner_id: str
     ) -> None:
@@ -61,6 +68,18 @@ class InMemoryRepository(PersistenceRepository):
     ) -> TestDefinition | None:
         td = self._test_definitions.get(test_id)
         return td if (td and td.owner_id == owner_id) else None
+
+    async def list_test_definitions(
+        self, project_id: uuid.UUID, owner_id: str
+    ) -> list[TestDefinition]:
+        return sorted(
+            [
+                td for td in self._test_definitions.values()
+                if td.project_id == project_id and td.owner_id == owner_id
+            ],
+            key=lambda td: td.created_at,
+            reverse=True,
+        )
 
     async def update_active_version(
         self, test_id: uuid.UUID, version_id: uuid.UUID, owner_id: str
