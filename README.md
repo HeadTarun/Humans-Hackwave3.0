@@ -1,4 +1,4 @@
-# HealTest — Adaptive Self-Healing E2E Testing Platform
+# GhostRunner — Adaptive Self-Healing E2E Testing Platform
 
 > **Intent-aware self-healing test automation backend**: Runs E2E tests against isolated applications, diagnoses failures using multi-modal browser & network runtime evidence, safely proposes minimal repairs for UI/locator drift without ever weakening test assertions, and verifies fixes before activation.
 
