@@ -1,4 +1,4 @@
-# HealTest — Adaptive Self-Healing E2E Testing Platform
+# GhoostRunner — Adaptive Self-Healing E2E Testing Platform
 
 > **Intent-aware self-healing test automation backend**: Runs E2E tests against isolated applications, diagnoses failures using multi-modal browser & network runtime evidence, safely proposes minimal repairs for UI/locator drift without ever weakening test assertions, and verifies fixes before activation.
 
@@ -22,7 +22,7 @@
 
 ## 🎯 MVP Goal & Core Principles
 
-Traditional self-healing testing platforms often make brittle tests pass by weakening assertions, deleting checks, or applying dangerous arbitrary code patches. **HealTest enforces strict integrity**:
+Traditional self-healing testing platforms often make brittle tests pass by weakening assertions, deleting checks, or applying dangerous arbitrary code patches. **GhoostRunner enforces strict integrity**:
 
 1. **Immutable Intent**: Original natural-language intent and required business assertions are **write-once and immutable**.
 2. **Minimal Repairs Only**: The system only ever updates the smallest necessary locator/action mapping when evidence confirms the control still exists (`LOCATOR_DRIFT`).
@@ -148,8 +148,8 @@ python run.py
 
 ### Docker Deployment
 ```bash
-docker build -t healtest-backend .
-docker run -p 8000:8000 --env-file .env healtest-backend
+docker build -t GhoostRunner-backend .
+docker run -p 8000:8000 --env-file .env GhoostRunner-backend
 ```
 
 ---
