@@ -14,7 +14,7 @@ build/
 venv/
 env/
 ENV/
-
+GhostRunner/
 # Environment secrets — NEVER commit
 .env
 .env.local

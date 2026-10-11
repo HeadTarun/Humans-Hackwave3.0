@@ -145,6 +145,7 @@ class TreeSitterInspector(RepositoryInspector):
             "routes": [],
             "components": [],
             "api_handlers": [],
+            "ux_elements": [],
             "relevant_files": [],
             "inspection_method": "tree_sitter" if self._ts_available else "structural",
             "bundle_truncated": False,
@@ -163,6 +164,8 @@ class TreeSitterInspector(RepositoryInspector):
                 continue
             total_chars += len(info.get("snippet", ""))
             rel = str(fpath.relative_to(root))
+            if "ux_elements" in info:
+                result["ux_elements"].extend(info["ux_elements"])
             if _is_api_file(rel):
                 result["api_handlers"].append(info)
             elif _is_route_file(rel):
@@ -203,6 +206,7 @@ class TreeSitterInspector(RepositoryInspector):
         test_ids: list[str] = []
         button_texts: list[str] = []
         link_texts: list[str] = []
+        ux_elements: list[dict[str, Any]] = []
 
         if self._ts_available and self._parser and self._language:
             try:
@@ -213,6 +217,9 @@ class TreeSitterInspector(RepositoryInspector):
                 button_texts, link_texts = self._extract_button_link_texts(
                     tree.root_node, source
                 )
+                # UX False Positive Context: handlers, ARIA, state guards, wrappers
+                rel_file = str(fpath.relative_to(root))
+                ux_elements = self._extract_ux_elements(tree.root_node, source, rel_file)
             except Exception as exc:
                 logger.debug("Tree-sitter parse error for %s: %s", fpath, exc)
 
@@ -224,6 +231,7 @@ class TreeSitterInspector(RepositoryInspector):
             "test_ids": test_ids[:20],
             "button_texts": button_texts[:20],   # Gap 4: button label text
             "link_texts": link_texts[:20],        # Gap 4: anchor label text
+            "ux_elements": ux_elements[:50],      # UX false positive grounding
             "snippet": snippet,
         }
 
@@ -368,6 +376,272 @@ class TreeSitterInspector(RepositoryInspector):
                 unique_links.append(t)
 
         return unique_buttons[:20], unique_links[:20]
+
+    def _extract_ux_elements(
+        self, root_node: Any, source: str, file_rel: str
+    ) -> list[dict[str, Any]]:
+        """Extract rich UX interactive elements for false positive diagnosis.
+
+        Captures:
+          - tag name (button, a, input, Button, IconButton, Link, DialogTrigger)
+          - inner visible text
+          - event handlers (onClick, onSubmit, etc.)
+          - state guards (disabled, aria-disabled)
+          - selectors (data-testid, id, aria-label, role)
+          - parent containers (Dialog, Modal, Form, Drawer)
+          - exact file & line number
+        """
+        INTERACTIVE_TAGS = {
+            "button", "a", "input", "select", "textarea",
+            "Button", "IconButton", "Link", "DialogTrigger",
+            "Pressable", "SubmitButton", "MenuItem", "ActionIcon",
+        }
+        CONTAINER_TAGS = {
+            "Dialog", "DialogContent", "Modal", "Drawer", "Sheet",
+            "Form", "Card", "Accordion", "Popover", "AlertDialog",
+        }
+
+        ux_elements: list[dict[str, Any]] = []
+
+        def _get_tag_name(open_node: Any) -> str:
+            for c in (open_node.children or []):
+                if c.type in ("identifier", "member_expression", "nested_identifier"):
+                    return source[c.start_byte:c.end_byte]
+            return ""
+
+        def _collect_jsx_text(elem_node: Any) -> str:
+            parts: list[str] = []
+            for child in (elem_node.children or []):
+                # Never traverse opening or closing tags or attributes
+                if child.type in ("jsx_opening_element", "jsx_closing_element", "jsx_attribute"):
+                    continue
+                if child.type == "jsx_text":
+                    txt = source[child.start_byte:child.end_byte].strip()
+                    if txt:
+                        parts.append(txt)
+                elif child.type == "jsx_element":
+                    sub_txt = _collect_jsx_text(child)
+                    if sub_txt:
+                        parts.append(sub_txt)
+                elif child.type == "jsx_expression":
+                    for expr_c in (child.children or []):
+                        if expr_c.type == "string":
+                            parts.append(source[expr_c.start_byte:expr_c.end_byte].strip("\"'"))
+                        elif expr_c.type == "identifier":
+                            parts.append(f"${{{source[expr_c.start_byte:expr_c.end_byte]}}}")
+            return " ".join(parts).strip()
+
+        def _parse_attributes(open_node: Any) -> dict[str, Any]:
+            attrs: dict[str, Any] = {}
+            for child in (open_node.children or []):
+                if child.type == "jsx_attribute":
+                    c_list = child.children or []
+                    if not c_list:
+                        continue
+                    attr_name = source[c_list[0].start_byte:c_list[0].end_byte]
+                    if len(c_list) == 1:
+                        attrs[attr_name] = True
+                    elif len(c_list) >= 3:
+                        val_node = c_list[2]
+                        if val_node.type == "string":
+                            val_str = source[val_node.start_byte:val_node.end_byte].strip("\"'")
+                            attrs[attr_name] = val_str
+                        elif val_node.type == "jsx_expression":
+                            expr_str = source[val_node.start_byte:val_node.end_byte].strip("{} ")
+                            attrs[attr_name] = expr_str
+            return attrs
+
+        def _walk(node: Any, containers: list[str]) -> None:
+            if len(ux_elements) >= 50:
+                return
+
+            if node.type in ("jsx_element", "jsx_self_closing_element"):
+                open_node = None
+                if node.type == "jsx_self_closing_element":
+                    open_node = node
+                else:
+                    for child in (node.children or []):
+                        if child.type == "jsx_opening_element":
+                            open_node = child
+                            break
+
+                if open_node is not None:
+                    tag = _get_tag_name(open_node)
+                    is_container = tag in CONTAINER_TAGS or any(tag.endswith(ct) for ct in CONTAINER_TAGS)
+                    curr_containers = containers + [tag] if is_container else containers
+
+                    attrs = _parse_attributes(open_node)
+                    has_handler = any(k.startswith("on") for k in attrs)
+                    is_interactive = (
+                        tag in INTERACTIVE_TAGS
+                        or tag.lower() in INTERACTIVE_TAGS
+                        or has_handler
+                        or "data-testid" in attrs
+                        or attrs.get("role") in ("button", "link", "tab")
+                    )
+
+                    if is_interactive:
+                        line_no = node.start_point[0] + 1
+                        inner_text = _collect_jsx_text(node) if node.type == "jsx_element" else ""
+
+                        # Find primary handler
+                        handler = next((f"{k}={{{attrs[k]}}}" for k in ("onClick", "onSubmit", "onPress", "onChange") if k in attrs), None)
+
+                        # Find disabled guard
+                        disabled_cond = None
+                        if "disabled" in attrs:
+                            disabled_cond = str(attrs["disabled"])
+                        elif "aria-disabled" in attrs:
+                            disabled_cond = str(attrs["aria-disabled"])
+
+                        ux_elements.append({
+                            "tag": tag,
+                            "text": inner_text[:100],
+                            "test_id": attrs.get("data-testid") or attrs.get("testId") or attrs.get("data-cy"),
+                            "aria_label": attrs.get("aria-label"),
+                            "handler": handler,
+                            "disabled_guard": disabled_cond,
+                            "parent_wrappers": list(containers),
+                            "file": file_rel,
+                            "line": line_no,
+                        })
+
+                    # Recurse children with updated container stack
+                    for child in (node.children or []):
+                        if child != open_node:
+                            _walk(child, curr_containers)
+                    return
+
+            for child in (node.children or []):
+                _walk(child, containers)
+
+        try:
+            _walk(root_node, [])
+        except Exception as exc:
+            logger.debug("UX elements extraction error: %s", exc)
+
+        return ux_elements
+
+
+def format_llm_ux_context(
+    inspection_result: dict[str, Any],
+    failed_target: dict[str, Any] | None = None,
+) -> str:
+    """Format extracted Tree-Sitter UX elements into an LLM grounding block."""
+    ux_elements = inspection_result.get("ux_elements", [])
+    if not ux_elements:
+        return "No interactive UX elements indexed in codebase."
+
+    lines = [
+        "### [Repository UX Semantic Context (Tree-Sitter AST Analysis)]",
+        "The following interactive components and event handlers exist in the current codebase:",
+    ]
+
+    for el in ux_elements[:15]:
+        tag = el.get("tag", "element")
+        file_loc = f"{el.get('file', 'unknown')}:{el.get('line', '?')}"
+        details = []
+        if el.get("text"):
+            details.append(f'Text: "{el["text"]}"')
+        if el.get("handler"):
+            details.append(f'Handler: `{el["handler"]}`')
+        if el.get("test_id"):
+            details.append(f'TestId: `data-testid="{el["test_id"]}"`')
+        if el.get("aria_label"):
+            details.append(f'AriaLabel: `aria-label="{el["aria_label"]}"`')
+        if el.get("disabled_guard"):
+            details.append(f'DisabledGuard: `disabled={{{el["disabled_guard"]}}}`')
+        if el.get("parent_wrappers"):
+            details.append(f'NestedInside: {el["parent_wrappers"]}')
+
+        lines.append(f"- `<{tag}>` at `{file_loc}`: " + " | ".join(details))
+
+    lines.append("")
+    lines.append(
+        "[LLM Guidance]: Compare failing test expectations with current codebase UX elements. "
+        "If an element has an equivalent handler (e.g. handleCheckout / handlePayment) or evolved text, "
+        "classify as LOCATOR_DRIFT (False Positive) rather than UI_FUNCTIONAL_REGRESSION."
+    )
+    return "\n".join(lines)
+
+
+def analyze_ux_false_positive(
+    ux_elements: list[dict[str, Any]],
+    failed_target: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Evaluate whether an E2E test failure is a False Positive caused by UX drift."""
+    target_name = (failed_target.get("name") or failed_target.get("text") or "").strip().lower()
+    if not target_name:
+        return None
+
+    import difflib
+
+    UX_SYNONYMS = {
+        "order": {"purchase", "checkout", "buy", "pay", "payment"},
+        "pay": {"payment", "checkout", "order", "purchase"},
+        "payment": {"pay", "checkout", "order", "purchase"},
+        "purchase": {"order", "pay", "checkout", "buy"},
+        "checkout": {"order", "purchase", "pay", "payment"},
+        "login": {"signin", "sign-in", "auth"},
+        "signin": {"login", "log-in", "auth"},
+        "submit": {"send", "confirm", "apply", "save"},
+    }
+
+    best_match = None
+    best_score = 0.0
+
+    for el in ux_elements:
+        score = 0.0
+        text = (el.get("text") or "").lower()
+        aria = (el.get("aria_label") or "").lower()
+        test_id = (el.get("test_id") or "").lower()
+        handler = (el.get("handler") or "").lower()
+
+        # 1. Direct text / aria / testid similarity
+        ratio_text = difflib.SequenceMatcher(None, target_name, text).ratio() if text else 0.0
+        ratio_aria = difflib.SequenceMatcher(None, target_name, aria).ratio() if aria else 0.0
+        ratio_tid = difflib.SequenceMatcher(None, target_name, test_id).ratio() if test_id else 0.0
+        max_ratio = max(ratio_text, ratio_aria, ratio_tid)
+
+        # Substring / keyword matches (e.g. "pay" in "pay ${total}")
+        if text and (target_name in text or text in target_name):
+            max_ratio = max(max_ratio, 0.80)
+        if aria and (target_name in aria or aria in target_name):
+            max_ratio = max(max_ratio, 0.85)
+        if test_id and (target_name in test_id or test_id in target_name):
+            max_ratio = max(max_ratio, 0.85)
+
+        score = max_ratio
+
+        # 2. Semantic token & Handler match boost
+        words = re.findall(r'[a-zA-Z]+', target_name)
+        synonyms: set[str] = set()
+        for w in words:
+            synonyms.update(UX_SYNONYMS.get(w.lower(), set()))
+        all_semantic_tokens = {w.lower() for w in words} | synonyms
+
+        if any(tok in handler or tok in text for tok in all_semantic_tokens if len(tok) >= 3):
+            score = max(score, 0.88)
+
+        # 3. Disabled guard detection
+        is_disabled = bool(el.get("disabled_guard"))
+
+        if score > best_score and score >= 0.50:
+            best_score = score
+            suggested = (
+                f'[data-testid="{el["test_id"]}"]'
+                if el.get("test_id")
+                else (f'button:has-text("{el["text"]}")' if el.get("text") else f'[aria-label="{el["aria_label"]}"]')
+            )
+            best_match = {
+                "element": el,
+                "confidence": round(score, 2),
+                "is_false_positive": True,
+                "has_disabled_guard": is_disabled,
+                "suggested_selector": suggested,
+            }
+
+    return best_match
 
 
 def _is_route_file(rel: str) -> bool:

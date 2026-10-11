@@ -109,6 +109,7 @@ async def create_run(
         owner_id=owner_id,
         environment_ref=body.environment_ref,
         start_command=body.start_command,
+        callback_url=body.callback_url,
     )
     return RunResponse(**run.model_dump())
 

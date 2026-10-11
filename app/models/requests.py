@@ -23,6 +23,7 @@ class CreateTestRequest(BaseModel):
 class CreateRunRequest(BaseModel):
     environment_ref: Optional[str] = None
     start_command: Optional[str] = None  # Override project.repo_metadata["start_command"]
+    callback_url: Optional[str] = None  # Webhook/gateway callback for live progress events
 
 
 class TransitionRunRequest(BaseModel):

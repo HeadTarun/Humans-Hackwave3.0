@@ -26,6 +26,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+import httpx
 from fastapi import HTTPException
 
 from app.models.domain import (
@@ -493,12 +494,29 @@ class RunOrchestrator:
     # Public entry point
     # ------------------------------------------------------------------
 
+    async def _emit_event(
+        self,
+        callback_url: Optional[str],
+        run_id: uuid.UUID,
+        event: dict[str, Any],
+    ) -> None:
+        """Best-effort notification to gateway SSE stream."""
+        if not callback_url:
+            return
+        url = f"{callback_url.rstrip('/')}/api/runs/{run_id}/events"
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                await client.post(url, json=event)
+        except Exception as exc:
+            logger.debug("Live event dispatch failed: %s", exc)
+
     async def execute_run(
         self,
         test_id: uuid.UUID,
         owner_id: str,
         environment_ref: Optional[str] = None,
         start_command: Optional[str] = None,
+        callback_url: Optional[str] = None,
     ) -> TestRun:
         """Full lifecycle: create → prepare → run → collect → classify → verdict.
 
@@ -531,12 +549,22 @@ class RunOrchestrator:
             owner_id,
             CreateRunRequest(environment_ref=environment_ref),
         )
+        await self._emit_event(
+            callback_url,
+            run.id,
+            {"type": "status", "status": "queued", "pct": 5, "line": f"[orchestrator] Test run {run.id} queued"},
+        )
 
         sandbox_id: Optional[str] = None
 
         try:
             # ── PREPARING ──────────────────────────────────────────────
             run = await self._transition(run, RunStatus.PREPARING, owner_id)
+            await self._emit_event(
+                callback_url,
+                run.id,
+                {"type": "status", "status": "preparing", "pct": 20, "line": "[sandbox] Allocating environment container..."},
+            )
 
             start_cmd = start_command or self._resolve_start_command(project)
             repo_path = self._resolve_repo_path(project)
@@ -553,10 +581,20 @@ class RunOrchestrator:
                 run = await self._fail_environment(
                     run, owner_id, f"Sandbox setup failed: {exc}"
                 )
+                await self._emit_event(
+                    callback_url,
+                    run.id,
+                    {"type": "done", "status": "environment_failed", "pct": 100, "line": f"[error] Sandbox setup failed: {exc}"},
+                )
                 return run
 
             # ── RUNNING ────────────────────────────────────────────────
             run = await self._transition(run, RunStatus.RUNNING, owner_id)
+            await self._emit_event(
+                callback_url,
+                run.id,
+                {"type": "status", "status": "running", "pct": 45, "line": f"[browser] Launching Playwright Chromium against {base_url}..."},
+            )
 
             version = await self._repo.get_test_version(test_def.active_version_id)
             if not version:
@@ -574,15 +612,30 @@ class RunOrchestrator:
                 run = await self._fail_environment(
                     run, owner_id, f"Browser execution error: {exc}"
                 )
+                await self._emit_event(
+                    callback_url,
+                    run.id,
+                    {"type": "done", "status": "environment_failed", "pct": 100, "line": f"[error] Browser execution error: {exc}"},
+                )
                 return run
 
             # ── COLLECTING_EVIDENCE ────────────────────────────────────
             run = await self._transition(run, RunStatus.COLLECTING_EVIDENCE, owner_id)
+            await self._emit_event(
+                callback_url,
+                run.id,
+                {"type": "status", "status": "collecting_evidence", "pct": 70, "line": "[evidence] Capturing DOM snapshots, logs & a11y tree..."},
+            )
 
             evidence_dict = await self._store_evidence(run, raw_evidence)
 
             # ── CLASSIFYING ────────────────────────────────────────────
             run = await self._transition(run, RunStatus.CLASSIFYING, owner_id)
+            await self._emit_event(
+                callback_url,
+                run.id,
+                {"type": "status", "status": "classifying", "pct": 85, "line": "[ai] Classifying test results & failure semantics..."},
+            )
 
             # Determine verdict
             # BrowserEvidence or dict from FakeBrowserRunner
@@ -728,6 +781,17 @@ class RunOrchestrator:
                             repair_meta.encode("utf-8")
                         )
 
+            await self._emit_event(
+                callback_url,
+                run.id,
+                {
+                    "type": "done",
+                    "status": run.status.value,
+                    "pct": 100,
+                    "summary": run.summary or ("Run passed" if run.status == RunStatus.PASSED else "Run failed"),
+                    "line": f"[verdict] Run complete: {run.status.value} - {run.summary or ''}",
+                },
+            )
             return run
 
         finally:
